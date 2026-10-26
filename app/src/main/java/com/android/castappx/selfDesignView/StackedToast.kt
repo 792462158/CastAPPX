@@ -5,8 +5,6 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
-import android.transition.AutoTransition
-import android.transition.TransitionManager
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -45,6 +43,10 @@ class StackedToast(
         isFocusable = false
         clipChildren = false
         clipToPadding = false
+        val density = resources.displayMetrics.density
+        val horizontal = (24 * density + 0.5f).toInt()
+        val bottom = (32 * density + 0.5f).toInt()
+        setPadding(horizontal, 0, horizontal, bottom)
     }
     private val stack = LinearLayout(activity).apply {
         orientation = LinearLayout.VERTICAL
@@ -95,14 +97,16 @@ class StackedToast(
         if (released || message.isBlank()) return
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
 
+        // 复用已布局的容器时，在动画开始前同步安全区域。
+        ViewCompat.getRootWindowInsets(overlay)?.let(::updateInsets)
         overlay.bringToFront()
-        animateChanges()
 
         while (stack.childCount >= maxVisible) {
             remove(stack.getChildAt(0))
         }
 
         val item = TextView(overlay.context).apply {
+            alpha = 0f
             text = message
             textSize = 14f
             setTextColor(Color.WHITE)
@@ -129,11 +133,10 @@ class StackedToast(
             },
         )
 
+        item.animate().alpha(1f).setDuration(180L).start()
+
         val expire = Runnable {
-            if (!released) {
-                animateChanges()
-                remove(item)
-            }
+            if (!released) remove(item, animated = true)
         }
         pending[item] = expire
         handler.postDelayed(expire, durationMillis)
@@ -143,6 +146,9 @@ class StackedToast(
         checkMainThread()
         handler.removeCallbacksAndMessages(null)
         pending.clear()
+        for (index in 0 until stack.childCount) {
+            stack.getChildAt(index).animate().withEndAction(null).cancel()
+        }
         stack.removeAllViews()
     }
 
@@ -156,17 +162,22 @@ class StackedToast(
         lifecycle.removeObserver(this)
     }
 
-    private fun remove(item: View) {
+    private fun remove(item: View, animated: Boolean = false) {
         pending.remove(item)?.let(handler::removeCallbacks)
-        stack.removeView(item)
-    }
+        item.animate().withEndAction(null).cancel()
+        if (item.parent !== stack) return
 
-    private fun animateChanges() {
-        if (ViewCompat.isLaidOut(overlay)) {
-            TransitionManager.beginDelayedTransition(
-                overlay,
-                AutoTransition().apply { duration = 180L },
-            )
+        if (animated) {
+            // 淡出期间保留布局位置，避免移除 View 时父容器重排影响退出动画。
+            item.animate()
+                .alpha(0f)
+                .setDuration(180L)
+                .withEndAction {
+                    if (item.parent === stack) stack.removeView(item)
+                }
+                .start()
+        } else {
+            stack.removeView(item)
         }
     }
 

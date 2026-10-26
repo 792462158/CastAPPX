@@ -36,6 +36,10 @@ class MainActivity : AppCompatActivity() {
     }
 
 
+    fun showStackedToast(message: CharSequence) {
+        stackedToast.show(message)
+    }
+
     private fun requestPermissions() {
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             permissions.entries.forEach { (permission, granted) ->

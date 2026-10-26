@@ -23,12 +23,12 @@ object PermissionHelper {
     }.toTypedArray()
 
 
+    fun checkPermission(context: Context, permission: String) =
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
     fun allPermissionsGranted(context: Context) = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        checkPermission(context, it)
     }
-
-
 
 
 }
