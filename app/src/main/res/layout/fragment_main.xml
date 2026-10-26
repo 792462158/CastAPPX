@@ -30,7 +30,17 @@
             android:orientation="vertical"
             app:layout_constraintGuide_percent=".50" />
 
-
+        <androidx.camera.view.PreviewView
+            android:id="@+id/my_result_view"
+            android:layout_width="0dp"
+            android:layout_height="200dp"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="16dp"
+            android:layout_marginEnd="16dp"
+            android:text="Button"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/btn_switch_camera" />
 
 
     </androidx.constraintlayout.widget.ConstraintLayout>
