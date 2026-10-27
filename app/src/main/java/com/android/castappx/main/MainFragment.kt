@@ -17,13 +17,19 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toDrawable
+import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.ViewModelProvider
 import com.android.castappx.MainActivity
@@ -44,6 +50,7 @@ class MainFragment : Fragment() {
     private var projectionService: MyMediaProjectionService? = null
     private var serviceBound = false
     private var previewSurface: Surface? = null
+    private var deviceDialog: AlertDialog? = null
 
     private val projectionPermission =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -112,6 +119,7 @@ class MainFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         binding.mainViewModel = viewModel
         binding.lifecycleOwner = viewLifecycleOwner
+        setupSocketChat()
 
         binding.screenPreview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(
@@ -176,6 +184,107 @@ class MainFragment : Fragment() {
         updateControls()
         val manager = requireContext().getSystemService(MediaProjectionManager::class.java)
         projectionPermission.launch(manager.createScreenCaptureIntent())
+    }
+
+    private fun setupSocketChat() {
+        val chat = viewModel.socketChat
+        binding.btnStartSocketServer.setOnClickListener {
+            if (chat.serverRunning.value == true) chat.disconnect() else chat.startServer()
+        }
+        binding.btnConnectToSocketServer.setOnClickListener {
+            if (chat.connected.value == true || chat.connecting.value == true) chat.disconnect()
+            else showDeviceDialog()
+        }
+        binding.btnSendMessage.setOnClickListener { chat.send(binding.messageInput.text.toString()) }
+        binding.messageInput.doAfterTextChanged { updateSocketControls() }
+        chat.status.observe(viewLifecycleOwner) { binding.socketStatus.text = it }
+        chat.serverRunning.observe(viewLifecycleOwner) { updateSocketControls() }
+        chat.connected.observe(viewLifecycleOwner) { updateSocketControls() }
+        chat.connecting.observe(viewLifecycleOwner) { updateSocketControls() }
+        chat.sending.observe(viewLifecycleOwner) { updateSocketControls() }
+        var lastSentSequence = chat.sentSequence.value
+        chat.sentSequence.observe(viewLifecycleOwner) {
+            if (it != lastSentSequence) binding.messageInput.text.clear()
+            lastSentSequence = it
+        }
+        chat.messages.observe(viewLifecycleOwner) { messages ->
+            val scroll = binding.chatScroll
+            val followLatest = !scroll.canScrollVertically(1)
+            binding.chatMessages.text = if (messages.isEmpty()) getString(R.string.chat_empty)
+            else messages.joinToString("\n\n")
+            if (followLatest) scroll.post {
+                if (_binding != null) scroll.smoothScrollTo(0, scroll.getChildAt(0).height)
+            }
+        }
+    }
+
+    private fun updateSocketControls() {
+        val current = _binding ?: return
+        val chat = viewModel.socketChat
+        current.btnStartSocketServer.setText(if (chat.serverRunning.value == true) R.string.stop_socket_server else R.string.start_socket_server)
+        current.btnStartSocketServer.isEnabled =
+            chat.connecting.value != true && (chat.connected.value != true || chat.serverRunning.value == true)
+        current.btnConnectToSocketServer.setText(
+            when {
+                chat.connecting.value == true -> R.string.cancel_socket_connection
+                chat.connected.value == true -> R.string.disconnect_socket
+                else -> R.string.connect_to_socket_server
+            }
+        )
+        current.messageInput.isEnabled = chat.sending.value != true
+        current.btnSendMessage.isEnabled =
+            chat.connected.value == true && chat.sending.value != true && !current.messageInput.text.isNullOrBlank()
+    }
+
+    private fun showDeviceDialog() {
+        if (deviceDialog != null) return
+        val chat = viewModel.socketChat
+        val context = requireContext()
+        val padding = (16 * resources.displayMetrics.density).toInt()
+        val searchStatus =
+            TextView(context).apply { setPadding(padding, padding, padding, padding) }
+        val adapter = ArrayAdapter<String>(context, android.R.layout.simple_list_item_1)
+        val list = ListView(context).apply { this.adapter = adapter }
+        val content = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(searchStatus)
+            addView(
+                list,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    (240 * resources.displayMetrics.density).toInt()
+                )
+            )
+        }
+        val deviceObserver =
+            androidx.lifecycle.Observer<List<android.net.nsd.NsdServiceInfo>> { devices ->
+                adapter.clear()
+                adapter.addAll(devices.map { it.serviceName })
+                adapter.notifyDataSetChanged()
+            }
+        val statusObserver = androidx.lifecycle.Observer<String> { searchStatus.text = it }
+        val dialog = AlertDialog.Builder(context)
+            .setTitle(R.string.select_socket_device)
+            .setView(content)
+            .setNegativeButton(R.string.close_device_search, null)
+            .create()
+        deviceDialog = dialog
+        list.setOnItemClickListener { _, _, position, _ ->
+            chat.devices.value?.getOrNull(position)?.let { device ->
+                dialog.dismiss()
+                chat.connect(device)
+            }
+        }
+        dialog.setOnDismissListener {
+            chat.stopDiscovery()
+            chat.devices.removeObserver(deviceObserver)
+            chat.discoveryStatus.removeObserver(statusObserver)
+            deviceDialog = null
+        }
+        chat.startDiscovery()
+        chat.devices.observe(viewLifecycleOwner, deviceObserver)
+        chat.discoveryStatus.observe(viewLifecycleOwner, statusObserver)
+        dialog.show()
     }
 
     private fun updateControls() {
@@ -256,6 +365,7 @@ class MainFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        deviceDialog?.dismiss()
         stopCamera()
         releasePreviewSurface()
         if (serviceBound) requireContext().unbindService(connection)

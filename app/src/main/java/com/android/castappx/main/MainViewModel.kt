@@ -1,9 +1,16 @@
 package com.android.castappx.main
 
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.MutableLiveData
-import androidx.lifecycle.ViewModel
+import com.android.castappx.socket.SocketChat
 
-class MainViewModel: ViewModel() {
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+    val socketChat = SocketChat(application)
+
+    override fun onCleared() {
+        socketChat.close()
+    }
 
     val show_state = MutableLiveData(ShowState.OFF)
 

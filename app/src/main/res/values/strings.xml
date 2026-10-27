@@ -17,4 +17,14 @@
     <string name="projection_channel">屏幕录制</string>
     <string name="projection_notification_title">正在录制屏幕画面</string>
     <string name="projection_notification_text">点击返回预览，或停止屏幕录制</string>
+    <string name="start_socket_server">启动Socket服务器</string>
+    <string name="stop_socket_server">停止Socket服务器</string>
+    <string name="connect_to_socket_server">连接Socket服务器</string>
+    <string name="message_hint">输入消息</string>
+    <string name="send_message">发送</string>
+    <string name="select_socket_device">选择局域网设备</string>
+    <string name="close_device_search">关闭</string>
+    <string name="disconnect_socket">断开连接</string>
+    <string name="cancel_socket_connection">取消连接</string>
+    <string name="chat_empty">连接设备后即可互相发送消息</string>
 </resources>
