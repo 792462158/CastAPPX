@@ -2,10 +2,14 @@ package com.android.castappx.main
 
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import java.util.concurrent.ExecutorService
 
 class MainViewModel: ViewModel() {
 
     val show_state = MutableLiveData(ShowState.OFF)
+
+
+    private lateinit var cameraExecutor: ExecutorService
 
     fun possibleNextState(): ShowState {
         val currentState = show_state.value
@@ -18,6 +22,7 @@ class MainViewModel: ViewModel() {
         val nextState = nextStates[(nextStates.indexOf(currentState) + 1) % nextStates.size]
         return nextState
     }
+
 
 }
 
