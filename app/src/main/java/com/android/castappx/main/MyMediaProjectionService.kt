@@ -34,6 +34,11 @@ import com.android.castappx.R
 import java.nio.ByteBuffer
 
 class MyMediaProjectionService : Service() {
+    private var audioCapture: com.android.castappx.audio.AudioCapture? = null
+    val audioError = MutableLiveData(false)
+    @Volatile
+    var onAudio: ((ByteArray, Int) -> Unit)? = null
+
     private val binder = LocalBinder()
     private val handler = Handler(Looper.getMainLooper())
     private val _active = MutableLiveData(false)
@@ -72,7 +77,7 @@ class MyMediaProjectionService : Service() {
                 val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
                     val now = SystemClock.elapsedRealtime()
-                    if (now - lastFrameAt >= 125) {
+                    if (now - lastFrameAt >= com.android.castappx.socket.VideoProtocol.FRAME_INTERVAL_MS) {
                         lastFrameAt = now
                         val plane = image.planes[0]
                         val sourceBuffer = plane.buffer
@@ -163,6 +168,18 @@ class MyMediaProjectionService : Service() {
                 reader!!.surface, null, handler
             )
             _active.value = true
+            audioError.value = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    audioCapture = com.android.castappx.audio.AudioCapture.start(
+                        projection,
+                        onError = { audioError.postValue(true) },
+                        onPcm = { bytes, size -> onAudio?.invoke(bytes, size) })
+                } catch (error: Exception) {
+                    Log.w(TAG, "Unable to capture device audio", error)
+                    audioError.value = true
+                }
+            }
         } catch (error: RuntimeException) {
             Log.e(TAG, "Unable to start screen capture", error)
             _error.value = true
@@ -172,6 +189,8 @@ class MyMediaProjectionService : Service() {
     }
 
     fun stopCapture() {
+        audioCapture?.close()
+        audioCapture = null
         display?.release()
         display = null
         val oldReader = reader
@@ -255,6 +274,7 @@ class MyMediaProjectionService : Service() {
     override fun onDestroy() {
         stopCapture()
         onFrame = null
+        onAudio = null
         captureHandler.removeCallbacks(repeatFrame)
         captureThread.quitSafely()
         super.onDestroy()

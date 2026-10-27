@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Surface
 import androidx.lifecycle.MutableLiveData
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -20,15 +21,74 @@ import java.util.concurrent.Executors
 /** All state and NSD callbacks are serialized on the main thread; socket IO stays off it. */
 @Suppress("DEPRECATION")
 class SocketChat(context: Context) {
-    val remoteFrame = MutableLiveData<Bitmap?>(null)
+    val muted = MutableLiveData(false)
+    val mediaReady = MutableLiveData(false)
+
+    fun toggleMute() {
+        val value = muted.value != true
+        muted.value = value
+        video?.setMuted(value)
+    }
+
+    fun sendAudio(pcm: ByteArray, size: Int) {
+        video?.sendAudio(pcm, size)
+    }
+
+    val remoteStalled = MutableLiveData(false)
+    private var captureActive = false
+    private var remoteCaptureActive: Boolean? = null
+
+    fun setCaptureActive(active: Boolean) {
+        if (captureActive == active) return
+        captureActive = active
+        sendCaptureState()
+    }
+
+    private fun sendCaptureState() {
+        val socket = peer ?: return
+        if (!canSendFrames()) return
+        val message = if (captureActive) "STREAM:ON" else "STREAM:OFF"
+        writer.execute {
+            try {
+                ChatProtocol.write(DataOutputStream(socket.getOutputStream()), message)
+            } catch (_: Exception) {
+                dispatch { dropPeer(socket, "画面状态发送失败，连接已断开") }
+            }
+        }
+    }
+
+    val remoteFrame = MutableLiveData(false)
+    val remoteVideoSize = MutableLiveData<android.util.Size>()
+    private var remoteSurface: Surface? = null
+    fun setRemoteSurface(surface: Surface?) {
+        remoteSurface = surface
+        video?.setSurface(surface)
+    }
     @Volatile
-    private var video: UdpVideo? = null
+    private var video: SocketMedia? = null
     private var lastFrameAt = 0L
+    private var lastStatisticsAt = 0L
     private val frameTimeout = object : Runnable {
         override fun run() {
             if (closed) return
-            if (remoteFrame.value != null && SystemClock.elapsedRealtime() - lastFrameAt > 2500) {
-                remoteFrame.value = null
+            // Network jitter should freeze the last good image, never flash black.
+            val stalled = remoteFrame.value == true &&
+                    SystemClock.elapsedRealtime() - lastFrameAt > 2500
+            if (remoteStalled.value != stalled) remoteStalled.value = stalled
+            val now = SystemClock.elapsedRealtime()
+            val media = video
+            val socket = peer
+            if (media?.isSender == true && socket != null && now - lastStatisticsAt >= 5000) {
+                lastStatisticsAt = now
+                val message = "STATS:${media.statistics()}"
+                writer.execute {
+                    runCatching {
+                        ChatProtocol.write(
+                            DataOutputStream(socket.getOutputStream()),
+                            message
+                        )
+                    }
+                }
             }
             main.postDelayed(this, 500)
         }
@@ -250,33 +310,52 @@ class SocketChat(context: Context) {
         }, 10000)
     }
 
+    private fun sendKeyFrameRequest(socket: Socket) {
+        if (closed) return
+        writer.execute {
+            try {
+                ChatProtocol.write(DataOutputStream(socket.getOutputStream()), "KEYFRAME")
+            } catch (_: Exception) {
+                dispatch { dropPeer(socket, "连接已断开") }
+            }
+        }
+    }
+
     private fun attach(socket: Socket, name: String) {
         peer = socket
         if (server != null) {
             try {
                 val token = java.security.SecureRandom().nextLong()
-                lateinit var transport: UdpVideo
-                transport = UdpVideo(socket.localPort, socket.inetAddress, 0, token) { bitmap ->
+                lateinit var transport: SocketMedia
+                transport = SocketMedia(
+                    socket.localPort, socket.inetAddress, 0, token,
+                    onError = { reason -> dispatch { dropPeer(socket, "视频处理失败：$reason") } },
+                    requestKeyFrame = { sendKeyFrameRequest(socket) }) { width, height ->
                     dispatch {
-                        if (video === transport && peer === socket) {
+                        if (video === transport && peer === socket && remoteCaptureActive != false) {
                             lastFrameAt = SystemClock.elapsedRealtime()
-                            remoteFrame.value = bitmap
+                            if (remoteStalled.value == true) remoteStalled.value = false
+                            val size = android.util.Size(width, height)
+                            if (remoteVideoSize.value != size) remoteVideoSize.value = size
+                            if (remoteFrame.value != true) remoteFrame.value = true
                         }
                     }
                 }
+                transport.setMuted(muted.value == true)
+                transport.setSurface(remoteSurface)
                 video = transport
                 writer.execute {
                     try {
                         ChatProtocol.write(
                             DataOutputStream(socket.getOutputStream()),
-                            "VIDEO:$token"
+                            "AVC:$token"
                         )
                     } catch (_: Exception) {
                         dispatch { dropPeer(socket, "画面通道建立失败") }
                     }
                 }
             } catch (e: Exception) {
-                dropPeer(socket, "UDP通道启动失败：${e.localizedMessage}")
+                dropPeer(socket, "音视频通道启动失败：${e.localizedMessage}")
                 return
             }
         }
@@ -292,16 +371,41 @@ class SocketChat(context: Context) {
                     dispatch {
                         if (peer === socket) {
                             when {
+                                server != null && message.startsWith("STATS:") -> android.util.Log.d(
+                                    "SocketMedia",
+                                    "Peer ${message.removePrefix("STATS:")}"
+                                )
+
+                                server != null && message == "STREAM:OFF" -> {
+                                    remoteCaptureActive = false
+                                    remoteFrame.value = false
+                                    if (remoteStalled.value == true) remoteStalled.value = false
+                                }
+
+                                server != null && message == "STREAM:ON" -> {
+                                    remoteCaptureActive = true
+                                }
                                 message.startsWith("CHAT:") -> append("对方：${message.removePrefix("CHAT:")}")
-                                server == null && message.startsWith("VIDEO:") -> {
-                                    val token = message.removePrefix("VIDEO:").toLongOrNull()
+                                server == null && message == "KEYFRAME" -> video?.requestKeyFrame()
+                                server == null && message.startsWith("AVC:") -> {
+                                    val token = message.removePrefix("AVC:").toLongOrNull()
                                     if (token != null) {
                                         try {
                                             video?.close()
-                                            video =
-                                                UdpVideo(0, socket.inetAddress, socket.port, token)
+                                            video = SocketMedia(
+                                                0, socket.inetAddress, socket.port, token,
+                                                onError = { reason ->
+                                                    dispatch {
+                                                        dropPeer(
+                                                            socket,
+                                                            "视频处理失败：$reason"
+                                                        )
+                                                    }
+                                                })
+                                            mediaReady.value = true
+                                            sendCaptureState()
                                         } catch (_: Exception) {
-                                            dropPeer(socket, "UDP通道启动失败")
+                                            dropPeer(socket, "音视频通道启动失败")
                                         }
                                     }
                                 }
@@ -345,7 +449,10 @@ class SocketChat(context: Context) {
         peer = null
         video?.close()
         video = null
-        remoteFrame.value = null
+        mediaReady.value = false
+        remoteFrame.value = false
+        remoteStalled.value = false
+        remoteCaptureActive = null
         connected.value = false
         sending.value = false
         status.value = if (server != null) "$reason，等待新连接" else reason

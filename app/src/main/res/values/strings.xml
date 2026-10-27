@@ -29,4 +29,11 @@
     <string name="chat_empty">连接设备后即可互相发送消息</string>
     <string name="preview_waiting_for_frame">等待画面接收</string>
     <string name="preview_receiving_frame">正在接收画面</string>
+    <string name="mute_audio">静音</string>
+    <string name="unmute_audio">取消静音</string>
+    <string name="audio_permission_required">请授予麦克风权限，以传输声音</string>
+    <string name="microphone_failed">麦克风采集失败，请检查权限或重新开启摄像头</string>
+    <string name="device_audio_failed">设备内音频采集失败，画面继续传输；请检查录音权限后重新录屏</string>
+    <string name="device_audio_unsupported">设备内声音传输需要 Android 10 或以上，当前仅传输画面</string>
+    <string name="preview_frame_stalled">画面传输中断，正在等待恢复…</string>
 </resources>

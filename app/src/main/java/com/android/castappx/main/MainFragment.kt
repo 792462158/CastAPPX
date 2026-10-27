@@ -43,12 +43,17 @@ class MainFragment : Fragment() {
 
     private val viewModel by lazy { ViewModelProvider(this)[MainViewModel::class.java] }
 
+    private var microphone: com.android.castappx.audio.AudioCapture? = null
+    private var resumed = false
+    private var cameraReady = false
+
     private var cameraProvider: ProcessCameraProvider? = null
 
     private var projectionService: MyMediaProjectionService? = null
     private var serviceBound = false
     private var cameraExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var deviceDialog: AlertDialog? = null
+    private var remoteSurface: android.view.Surface? = null
 
     private val projectionPermission =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -83,6 +88,10 @@ class MainFragment : Fragment() {
             projectionService = service
             val chat = viewModel.socketChat
             service.onFrame = { bitmap -> chat.sendFrame(bitmap) }
+            service.onAudio = { bytes, size -> chat.sendAudio(bytes, size) }
+            service.audioError.observe(viewLifecycleOwner) { failed ->
+                if (failed) showMessage(R.string.device_audio_failed)
+            }
             service.frame.observe(viewLifecycleOwner) { bitmap ->
                 if (viewModel.show_state.value == ShowState.PROJECTION_ON) binding.screenPreview.setImageBitmap(
                     bitmap
@@ -133,14 +142,45 @@ class MainFragment : Fragment() {
         if (cameraExecutor.isShutdown) cameraExecutor =
             java.util.concurrent.Executors.newSingleThreadExecutor()
         setupSocketChat()
+        binding.remotePreview.surfaceTextureListener =
+            object : android.view.TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    texture: android.graphics.SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    remoteSurface = android.view.Surface(texture)
+                    viewModel.socketChat.setRemoteSurface(remoteSurface)
+                    updateRemoteTransform()
+                }
+
+                override fun onSurfaceTextureSizeChanged(
+                    texture: android.graphics.SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    updateRemoteTransform()
+                }
+
+                override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) =
+                    Unit
+
+                override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+                    viewModel.socketChat.setRemoteSurface(null)
+                    remoteSurface?.release(); remoteSurface = null
+                    return true
+                }
+            }
 
         viewModel.show_state.observe(viewLifecycleOwner) { state ->
             val projecting = state == ShowState.PROJECTION_ON
             binding.screenPreview.visibility = if (projecting) View.VISIBLE else View.GONE
             val camera = state == ShowState.CAMERA_FRONT || state == ShowState.CAMERA_BACK
+            viewModel.socketChat.setCaptureActive(camera || projecting)
             binding.myResultView.visibility = if (camera) View.VISIBLE else View.GONE
             binding.remotePreview.visibility =
-                if (state == ShowState.RECEIVING_FRAME) View.VISIBLE else View.GONE
+                if (state == ShowState.RECEIVING_FRAME || state == ShowState.WAITING_FOR_FRAME) View.VISIBLE else View.GONE
+            binding.remotePreview.alpha = if (state == ShowState.RECEIVING_FRAME) 1f else 0f
             if (!projecting) binding.screenPreview.setImageDrawable(null)
             when (state) {
                 ShowState.CAMERA_FRONT -> startCamera(true)
@@ -178,6 +218,11 @@ class MainFragment : Fragment() {
     }
 
     private fun requestProjection() {
+        if (!checkPermission(requireContext(), PermissionHelper.RECORD_AUDIO_PERMISSION)) {
+            showMessage(R.string.audio_permission_required)
+            return
+        }
+        if (android.os.Build.VERSION.SDK_INT < 29) showMessage(R.string.device_audio_unsupported)
         viewModel.projectionPending = true
         updateControls()
         val manager = requireContext().getSystemService(MediaProjectionManager::class.java)
@@ -193,6 +238,9 @@ class MainFragment : Fragment() {
             if (chat.connected.value == true || chat.connecting.value == true) chat.disconnect()
             else showDeviceDialog()
         }
+        binding.btnMuteAudio.setOnClickListener { chat.toggleMute() }
+        chat.muted.observe(viewLifecycleOwner) { updateSocketControls() }
+        chat.mediaReady.observe(viewLifecycleOwner) { updateMicrophone() }
         binding.btnSendMessage.setOnClickListener { chat.send(binding.messageInput.text.toString()) }
         binding.messageInput.doAfterTextChanged { updateSocketControls() }
         chat.status.observe(viewLifecycleOwner) { binding.socketStatus.text = it }
@@ -201,7 +249,7 @@ class MainFragment : Fragment() {
                 viewModel.projectionPending = false
                 projectionService?.stopCapture()
                 viewModel.show_state.value =
-                    if (chat.remoteFrame.value == null) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
+                    if (chat.remoteFrame.value != true) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
             } else if (viewModel.show_state.value in listOf(
                     ShowState.WAITING_FOR_FRAME,
                     ShowState.RECEIVING_FRAME
@@ -212,14 +260,15 @@ class MainFragment : Fragment() {
             updateControls()
             updateSocketControls()
         }
-        chat.remoteFrame.observe(viewLifecycleOwner) { bitmap ->
-            binding.remotePreview.setImageBitmap(bitmap)
+        chat.remoteFrame.observe(viewLifecycleOwner) { hasFrame ->
             if (chat.serverRunning.value == true) {
                 val next =
-                    if (bitmap == null) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
+                    if (!hasFrame) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
                 if (viewModel.show_state.value != next) viewModel.show_state.value = next
             }
         }
+        chat.remoteVideoSize.observe(viewLifecycleOwner) { updateRemoteTransform() }
+        chat.remoteStalled.observe(viewLifecycleOwner) { updateControls() }
         chat.connected.observe(viewLifecycleOwner) { updateSocketControls() }
         chat.connecting.observe(viewLifecycleOwner) { updateSocketControls() }
         chat.sending.observe(viewLifecycleOwner) { updateSocketControls() }
@@ -239,6 +288,20 @@ class MainFragment : Fragment() {
         }
     }
 
+    private fun updateRemoteTransform() {
+        val preview = _binding?.remotePreview ?: return
+        val size = viewModel.socketChat.remoteVideoSize.value ?: return
+        if (preview.width == 0 || preview.height == 0) return
+        val scale =
+            minOf(preview.width.toFloat() / size.width, preview.height.toFloat() / size.height)
+        preview.setTransform(Matrix().apply {
+            setScale(
+                size.width * scale / preview.width, size.height * scale / preview.height,
+                preview.width / 2f, preview.height / 2f
+            )
+        })
+    }
+
     private fun updateSocketControls() {
         val current = _binding ?: return
         val chat = viewModel.socketChat
@@ -252,6 +315,10 @@ class MainFragment : Fragment() {
                 else -> R.string.connect_to_socket_server
             }
         )
+        current.btnMuteAudio.visibility =
+            if (chat.serverRunning.value == true) View.VISIBLE else View.GONE
+        current.btnMuteAudio.isEnabled = chat.connected.value == true
+        current.btnMuteAudio.setText(if (chat.muted.value == true) R.string.unmute_audio else R.string.mute_audio)
         current.messageInput.isEnabled = chat.sending.value != true
         current.btnSendMessage.isEnabled =
             chat.connected.value == true && chat.sending.value != true && !current.messageInput.text.isNullOrBlank()
@@ -310,6 +377,8 @@ class MainFragment : Fragment() {
 
     private fun updateControls() {
         val current = _binding ?: return
+        val state = viewModel.show_state.value
+        current.previewContainer.keepScreenOn = state != null && state != ShowState.OFF
         current.btnSwitchCamera.isEnabled =
             !viewModel.projectionPending && viewModel.socketChat.serverRunning.value != true
         current.btnScreenRecording.isEnabled =
@@ -321,7 +390,7 @@ class MainFragment : Fragment() {
                 ShowState.CAMERA_BACK -> R.string.preview_back_camera
                 ShowState.PROJECTION_ON -> R.string.preview_projection
                 ShowState.WAITING_FOR_FRAME -> R.string.preview_waiting_for_frame
-                ShowState.RECEIVING_FRAME -> R.string.preview_receiving_frame
+                ShowState.RECEIVING_FRAME -> if (viewModel.socketChat.remoteStalled.value == true) R.string.preview_frame_stalled else R.string.preview_receiving_frame
                 else -> R.string.preview_off
             }
         )
@@ -352,36 +421,39 @@ class MainFragment : Fragment() {
                     .build()
                 var lastFrameAt = 0L
                 analysis.setAnalyzer(cameraExecutor) { image ->
-                    try {
-                        val now = android.os.SystemClock.elapsedRealtime()
-                        if (chat.canSendFrames() && now - lastFrameAt >= 125) {
-                            lastFrameAt = now
-                            val source = image.toBitmap()
-                            val matrix =
-                                Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) }
-                            val rotated = android.graphics.Bitmap.createBitmap(
-                                source,
-                                0,
-                                0,
-                                source.width,
-                                source.height,
-                                matrix,
-                                true
-                            )
-                            try {
-                                chat.sendFrame(rotated)
-                            } finally {
-                                if (rotated !== source) rotated.recycle()
-                                source.recycle()
-                            }
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    var rotation = 0
+                    val source = try {
+                        if (!chat.canSendFrames() || now - lastFrameAt < com.android.castappx.socket.VideoProtocol.FRAME_INTERVAL_MS) {
+                            return@setAnalyzer
                         }
+                        lastFrameAt = now
+                        rotation = image.imageInfo.rotationDegrees
+                        image.toBitmap()
+                    } catch (error: RuntimeException) {
+                        Log.w(TAG, "Unable to copy camera frame", error)
+                        null
+                    } finally {
+                        // Release the camera buffer BEFORE JPEG encoding and socket IO.
+                        image.close()
+                    } ?: return@setAnalyzer
+                    var rotated: android.graphics.Bitmap? = null
+                    try {
+                        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                        rotated = android.graphics.Bitmap.createBitmap(
+                            source, 0, 0, source.width, source.height, matrix, true
+                        )
+                        chat.sendFrame(rotated)
                     } catch (error: RuntimeException) {
                         Log.w(TAG, "Unable to send camera frame", error)
                     } finally {
-                        image.close()
+                        if (rotated !== source) rotated?.recycle()
+                        source.recycle()
                     }
                 }
                 provider.bindToLifecycle(viewLifecycleOwner, selector, preview, analysis)
+                cameraReady = true
+                updateMicrophone()
             } catch (error: Exception) {
                 Log.e(TAG, "Unable to bind camera", error)
                 viewModel.show_state.value = ShowState.OFF
@@ -391,8 +463,45 @@ class MainFragment : Fragment() {
     }
 
     private fun stopCamera() {
+        cameraReady = false
+        microphone?.close()
+        microphone = null
         cameraProvider?.unbindAll()
         _binding?.myResultView?.foreground = Color.BLACK.toDrawable()
+    }
+
+    private fun updateMicrophone() {
+        val shouldRecord = resumed && cameraReady && viewModel.socketChat.canSendFrames()
+        if (!shouldRecord) {
+            microphone?.close()
+            microphone = null
+        } else if (microphone == null) {
+            if (!checkPermission(requireContext(), PermissionHelper.RECORD_AUDIO_PERMISSION)) {
+                showMessage(R.string.audio_permission_required)
+                return
+            }
+            try {
+                val chat = viewModel.socketChat
+                microphone = com.android.castappx.audio.AudioCapture.start(
+                    onError = { activity?.runOnUiThread { if (_binding != null) showMessage(R.string.microphone_failed) } },
+                    onPcm = { bytes, size -> chat.sendAudio(bytes, size) })
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to capture microphone", error)
+                showMessage(R.string.microphone_failed)
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        updateMicrophone()
+    }
+
+    override fun onPause() {
+        resumed = false
+        updateMicrophone()
+        super.onPause()
     }
 
     private fun serviceIntent() = Intent(requireContext(), MyMediaProjectionService::class.java)
@@ -402,6 +511,8 @@ class MainFragment : Fragment() {
 
     override fun onDestroyView() {
         deviceDialog?.dismiss()
+        viewModel.socketChat.setRemoteSurface(null)
+        remoteSurface?.release(); remoteSurface = null
         stopCamera()
         cameraExecutor.shutdownNow()
         if (serviceBound) requireContext().unbindService(connection)
