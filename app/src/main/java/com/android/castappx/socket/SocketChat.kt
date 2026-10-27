@@ -1,11 +1,13 @@
 package com.android.castappx.socket
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.lifecycle.MutableLiveData
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -18,6 +20,20 @@ import java.util.concurrent.Executors
 /** All state and NSD callbacks are serialized on the main thread; socket IO stays off it. */
 @Suppress("DEPRECATION")
 class SocketChat(context: Context) {
+    val remoteFrame = MutableLiveData<Bitmap?>(null)
+    @Volatile
+    private var video: UdpVideo? = null
+    private var lastFrameAt = 0L
+    private val frameTimeout = object : Runnable {
+        override fun run() {
+            if (closed) return
+            if (remoteFrame.value != null && SystemClock.elapsedRealtime() - lastFrameAt > 2500) {
+                remoteFrame.value = null
+            }
+            main.postDelayed(this, 500)
+        }
+    }
+
     val status = MutableLiveData("未连接")
     val messages = MutableLiveData<List<String>>(emptyList())
     val devices = MutableLiveData<List<NsdServiceInfo>>(emptyList())
@@ -44,6 +60,16 @@ class SocketChat(context: Context) {
     @Volatile
     private var closed = false
 
+    init {
+        main.post(frameTimeout)
+    }
+
+    fun sendFrame(bitmap: Bitmap) {
+        video?.send(bitmap)
+    }
+
+    fun canSendFrames(): Boolean = video?.isSender == true
+
     private fun dispatch(onClosed: () -> Unit = {}, action: () -> Unit) {
         main.post { if (!closed) action() else onClosed() }
     }
@@ -53,7 +79,7 @@ class SocketChat(context: Context) {
     }
 
     fun startServer() {
-        if (server != null || connecting.value == true) return
+        if (serverRunning.value == true || connecting.value == true) return
         disconnect()
         serverRunning.value = true
         status.value = "正在启动服务器…"
@@ -226,6 +252,34 @@ class SocketChat(context: Context) {
 
     private fun attach(socket: Socket, name: String) {
         peer = socket
+        if (server != null) {
+            try {
+                val token = java.security.SecureRandom().nextLong()
+                lateinit var transport: UdpVideo
+                transport = UdpVideo(socket.localPort, socket.inetAddress, 0, token) { bitmap ->
+                    dispatch {
+                        if (video === transport && peer === socket) {
+                            lastFrameAt = SystemClock.elapsedRealtime()
+                            remoteFrame.value = bitmap
+                        }
+                    }
+                }
+                video = transport
+                writer.execute {
+                    try {
+                        ChatProtocol.write(
+                            DataOutputStream(socket.getOutputStream()),
+                            "VIDEO:$token"
+                        )
+                    } catch (_: Exception) {
+                        dispatch { dropPeer(socket, "画面通道建立失败") }
+                    }
+                }
+            } catch (e: Exception) {
+                dropPeer(socket, "UDP通道启动失败：${e.localizedMessage}")
+                return
+            }
+        }
         connected.value = true
         connecting.value = false
         status.value = "已连接：$name"
@@ -235,7 +289,25 @@ class SocketChat(context: Context) {
                 val input = DataInputStream(socket.getInputStream())
                 while (!socket.isClosed) {
                     val message = ChatProtocol.read(input)
-                    dispatch { if (peer === socket) append("对方：$message") }
+                    dispatch {
+                        if (peer === socket) {
+                            when {
+                                message.startsWith("CHAT:") -> append("对方：${message.removePrefix("CHAT:")}")
+                                server == null && message.startsWith("VIDEO:") -> {
+                                    val token = message.removePrefix("VIDEO:").toLongOrNull()
+                                    if (token != null) {
+                                        try {
+                                            video?.close()
+                                            video =
+                                                UdpVideo(0, socket.inetAddress, socket.port, token)
+                                        } catch (_: Exception) {
+                                            dropPeer(socket, "UDP通道启动失败")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 dispatch { dropPeer(socket, "连接已断开") }
@@ -246,14 +318,14 @@ class SocketChat(context: Context) {
     fun send(text: String) {
         val socket = peer ?: return
         if (sending.value == true || text.isBlank()) return
-        if (text.toByteArray(Charsets.UTF_8).size > ChatProtocol.MAX_BYTES) {
+        if (text.toByteArray(Charsets.UTF_8).size > ChatProtocol.MAX_BYTES - 5) {
             status.value = "消息过长，请缩短后重试"
             return
         }
         sending.value = true
         writer.execute {
             try {
-                ChatProtocol.write(DataOutputStream(socket.getOutputStream()), text)
+                ChatProtocol.write(DataOutputStream(socket.getOutputStream()), "CHAT:$text")
                 dispatch {
                     if (peer === socket) {
                         append("我：$text")
@@ -271,6 +343,9 @@ class SocketChat(context: Context) {
         if (peer !== socket) return
         runCatching { socket.close() }
         peer = null
+        video?.close()
+        video = null
+        remoteFrame.value = null
         connected.value = false
         sending.value = false
         status.value = if (server != null) "$reason，等待新连接" else reason
@@ -295,6 +370,7 @@ class SocketChat(context: Context) {
         stopDiscovery()
         disconnect()
         closed = true
+        main.removeCallbacks(frameTimeout)
         io.shutdownNow()
         writer.shutdownNow()
     }

@@ -54,13 +54,24 @@
             <androidx.camera.view.PreviewView
                 android:id="@+id/my_result_view"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent" />
+                android:layout_height="match_parent"
+                app:implementationMode="compatible"
+                app:scaleType="fitCenter" />
 
-            <TextureView
+            <ImageView
                 android:id="@+id/screen_preview"
+                android:scaleType="fitCenter"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:contentDescription="@string/preview_projection"
+                android:visibility="gone" />
+
+            <ImageView
+                android:id="@+id/remote_preview"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="@string/preview_receiving_frame"
+                android:scaleType="fitCenter"
                 android:visibility="gone" />
         </FrameLayout>
 

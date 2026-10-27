@@ -27,4 +27,6 @@
     <string name="disconnect_socket">断开连接</string>
     <string name="cancel_socket_connection">取消连接</string>
     <string name="chat_empty">连接设备后即可互相发送消息</string>
+    <string name="preview_waiting_for_frame">等待画面接收</string>
+    <string name="preview_receiving_frame">正在接收画面</string>
 </resources>

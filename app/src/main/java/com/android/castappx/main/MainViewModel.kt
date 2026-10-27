@@ -31,5 +31,7 @@ enum class ShowState {
     OFF,    // 未开启
     CAMERA_FRONT,  // 前置摄像头
     CAMERA_BACK,   // 后置摄像头
-    PROJECTION_ON // 屏幕录制中
+    PROJECTION_ON, // 屏幕录制中
+    WAITING_FOR_FRAME, // 等待画面接收
+    RECEIVING_FRAME // 正在接收画面
 }

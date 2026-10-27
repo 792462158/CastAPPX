@@ -9,24 +9,29 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
-import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import com.android.castappx.MainActivity
 import com.android.castappx.R
+import java.nio.ByteBuffer
 
 class MyMediaProjectionService : Service() {
     private val binder = LocalBinder()
@@ -39,7 +44,68 @@ class MyMediaProjectionService : Service() {
     val error: LiveData<Boolean> = _error
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
-    private var outputSurface: Surface? = null
+    private val captureThread = HandlerThread("ScreenFrames").apply { start() }
+    private val captureHandler = Handler(captureThread.looper)
+    @Volatile
+    private var reader: ImageReader? = null
+    val frame = MutableLiveData<Bitmap?>(null)
+    @Volatile
+    var onFrame: ((Bitmap) -> Unit)? = null
+    private var lastFrameAt = 0L
+    private var latestCaptured: Pair<ImageReader, Bitmap>? = null
+    private val repeatFrame = object : Runnable {
+        override fun run() {
+            latestCaptured?.let { (source, bitmap) ->
+                if (reader === source) onFrame?.invoke(bitmap) else latestCaptured = null
+            }
+            captureHandler.postDelayed(this, 1000)
+        }
+    }
+
+    init {
+        captureHandler.post(repeatFrame)
+    }
+
+    private fun createReader(size: Size): ImageReader {
+        return ImageReader.newInstance(size.width, size.height, PixelFormat.RGBA_8888, 2).apply {
+            setOnImageAvailableListener({ source ->
+                val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastFrameAt >= 125) {
+                        lastFrameAt = now
+                        val plane = image.planes[0]
+                        val sourceBuffer = plane.buffer
+                        val packed = ByteBuffer.allocateDirect(image.width * image.height * 4)
+                        val row = ByteArray(image.width * 4)
+                        for (y in 0 until image.height) {
+                            sourceBuffer.position(y * plane.rowStride)
+                            sourceBuffer.get(row)
+                            packed.put(row)
+                        }
+                        packed.rewind()
+                        val bitmap =
+                            Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                        bitmap.copyPixelsFromBuffer(packed)
+                        latestCaptured = source to bitmap
+                        if (reader === source) onFrame?.invoke(bitmap)
+                        handler.post {
+                            if (reader === source && projection != null) frame.value = bitmap
+                        }
+                    }
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Unable to read screen frame", error)
+                } finally {
+                    image.close()
+                }
+            }, captureHandler)
+        }
+    }
+
+    private fun scaledSize(size: Size): Size {
+        val scale = minOf(1f, 960f / maxOf(size.width, size.height))
+        return Size(maxOf(1, (size.width * scale).toInt()), maxOf(1, (size.height * scale).toInt()))
+    }
 
     inner class LocalBinder : Binder() {
         val service: MyMediaProjectionService get() = this@MyMediaProjectionService
@@ -86,14 +152,15 @@ class MyMediaProjectionService : Service() {
             projection = getSystemService(MediaProjectionManager::class.java)
                 .getMediaProjection(Activity.RESULT_OK, consent)
             projection!!.registerCallback(projectionCallback, handler)
-            _captureSize.value = screenSize()
+            _captureSize.value = scaledSize(screenSize())
             // Create once per consent token; view recreation only replaces the surface.
             val size = _captureSize.value!!
+            reader = createReader(size)
             display = projection!!.createVirtualDisplay(
                 "CastAPPX screen preview", size.width, size.height,
                 resources.configuration.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                outputSurface, null, handler
+                reader!!.surface, null, handler
             )
             _active.value = true
         } catch (error: RuntimeException) {
@@ -104,14 +171,14 @@ class MyMediaProjectionService : Service() {
         return START_NOT_STICKY
     }
 
-    fun setSurface(surface: Surface?) {
-        outputSurface = surface
-        display?.surface = surface
-    }
-
     fun stopCapture() {
         display?.release()
         display = null
+        val oldReader = reader
+        reader = null
+        oldReader?.setOnImageAvailableListener(null, null)
+        captureHandler.post { oldReader?.close() }
+        frame.value = null
         projection?.unregisterCallback(projectionCallback)
         val previousProjection = projection
         projection = null
@@ -126,10 +193,19 @@ class MyMediaProjectionService : Service() {
         if (Build.VERSION.SDK_INT < 34 && projection != null) resizeCapture(screenSize())
     }
 
-    private fun resizeCapture(size: Size) {
-        if (size.width <= 0 || size.height <= 0 || _captureSize.value == size) return
-        _captureSize.value = size
+    private fun resizeCapture(contentSize: Size) {
+        if (contentSize.width <= 0 || contentSize.height <= 0) return
+        val size = scaledSize(contentSize)
+        if (_captureSize.value == size || projection == null) return
+        val oldReader = reader
+        val nextReader = createReader(size)
+        reader = nextReader
+        display?.surface = null
         display?.resize(size.width, size.height, resources.configuration.densityDpi)
+        display?.surface = nextReader.surface
+        _captureSize.value = size
+        oldReader?.setOnImageAvailableListener(null, null)
+        captureHandler.post { oldReader?.close() }
     }
 
     @Suppress("DEPRECATION")
@@ -178,7 +254,9 @@ class MyMediaProjectionService : Service() {
 
     override fun onDestroy() {
         stopCapture()
-        outputSurface = null
+        onFrame = null
+        captureHandler.removeCallbacks(repeatFrame)
+        captureThread.quitSafely()
         super.onDestroy()
     }
 

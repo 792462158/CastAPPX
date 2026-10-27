@@ -7,14 +7,11 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.Color
 import android.graphics.Matrix
-import android.graphics.SurfaceTexture
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
 import android.view.LayoutInflater
-import android.view.Surface
-import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
@@ -24,6 +21,7 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -49,11 +47,16 @@ class MainFragment : Fragment() {
 
     private var projectionService: MyMediaProjectionService? = null
     private var serviceBound = false
-    private var previewSurface: Surface? = null
+    private var cameraExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var deviceDialog: AlertDialog? = null
 
     private val projectionPermission =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (viewModel.socketChat.serverRunning.value == true) {
+                viewModel.projectionPending = false
+                updateControls()
+                return@registerForActivityResult
+            }
             if (result.resultCode == Activity.RESULT_OK && result.data != null) {
                 try {
                     ContextCompat.startForegroundService(
@@ -78,7 +81,14 @@ class MainFragment : Fragment() {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val service = (binder as MyMediaProjectionService.LocalBinder).service
             projectionService = service
-            service.captureSize.observe(viewLifecycleOwner) { updateProjectionSurface() }
+            val chat = viewModel.socketChat
+            service.onFrame = { bitmap -> chat.sendFrame(bitmap) }
+            service.frame.observe(viewLifecycleOwner) { bitmap ->
+                if (viewModel.show_state.value == ShowState.PROJECTION_ON) binding.screenPreview.setImageBitmap(
+                    bitmap
+                )
+            }
+            if (chat.serverRunning.value == true) service.stopCapture()
             service.error.observe(viewLifecycleOwner) { failed ->
                 if (failed) {
                     viewModel.projectionPending = false
@@ -87,7 +97,9 @@ class MainFragment : Fragment() {
                 }
             }
             service.active.observe(viewLifecycleOwner) { active ->
-                if (active) {
+                if (active && chat.serverRunning.value == true) {
+                    service.stopCapture()
+                } else if (active) {
                     viewModel.projectionPending = false
                     viewModel.show_state.value = ShowState.PROJECTION_ON
                 } else if (viewModel.show_state.value == ShowState.PROJECTION_ON) {
@@ -95,7 +107,6 @@ class MainFragment : Fragment() {
                 }
                 updateControls()
             }
-            updateProjectionSurface()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -119,40 +130,27 @@ class MainFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         binding.mainViewModel = viewModel
         binding.lifecycleOwner = viewLifecycleOwner
+        if (cameraExecutor.isShutdown) cameraExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor()
         setupSocketChat()
 
-        binding.screenPreview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(
-                texture: SurfaceTexture,
-                width: Int,
-                height: Int
-            ) = updateProjectionSurface()
-
-            override fun onSurfaceTextureSizeChanged(
-                texture: SurfaceTexture,
-                width: Int,
-                height: Int
-            ) = updateProjectionSurface()
-
-            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
-            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-                releasePreviewSurface()
-                return true
-            }
-        }
         viewModel.show_state.observe(viewLifecycleOwner) { state ->
             val projecting = state == ShowState.PROJECTION_ON
             binding.screenPreview.visibility = if (projecting) View.VISIBLE else View.GONE
-            binding.myResultView.visibility = if (projecting) View.GONE else View.VISIBLE
+            val camera = state == ShowState.CAMERA_FRONT || state == ShowState.CAMERA_BACK
+            binding.myResultView.visibility = if (camera) View.VISIBLE else View.GONE
+            binding.remotePreview.visibility =
+                if (state == ShowState.RECEIVING_FRAME) View.VISIBLE else View.GONE
+            if (!projecting) binding.screenPreview.setImageDrawable(null)
             when (state) {
                 ShowState.CAMERA_FRONT -> startCamera(true)
                 ShowState.CAMERA_BACK -> startCamera(false)
-                ShowState.OFF, ShowState.PROJECTION_ON -> stopCamera()
+                else -> stopCamera()
             }
             updateControls()
         }
         binding.btnSwitchCamera.setOnClickListener {
-            if (viewModel.projectionPending) return@setOnClickListener
+            if (viewModel.projectionPending || viewModel.socketChat.serverRunning.value == true) return@setOnClickListener
             val next = viewModel.possibleNextState()
             if (next == ShowState.CAMERA_FRONT || next == ShowState.CAMERA_BACK) {
                 if (!checkPermission(requireContext(), PermissionHelper.CAMERA_PERMISSION)) {
@@ -164,7 +162,7 @@ class MainFragment : Fragment() {
             viewModel.show_state.value = next
         }
         binding.btnScreenRecording.setOnClickListener {
-            if (viewModel.projectionPending) return@setOnClickListener
+            if (viewModel.projectionPending || viewModel.socketChat.serverRunning.value == true) return@setOnClickListener
             if (viewModel.show_state.value == ShowState.PROJECTION_ON) {
                 projectionService?.stopCapture()
             } else {
@@ -198,7 +196,30 @@ class MainFragment : Fragment() {
         binding.btnSendMessage.setOnClickListener { chat.send(binding.messageInput.text.toString()) }
         binding.messageInput.doAfterTextChanged { updateSocketControls() }
         chat.status.observe(viewLifecycleOwner) { binding.socketStatus.text = it }
-        chat.serverRunning.observe(viewLifecycleOwner) { updateSocketControls() }
+        chat.serverRunning.observe(viewLifecycleOwner) { running ->
+            if (running) {
+                viewModel.projectionPending = false
+                projectionService?.stopCapture()
+                viewModel.show_state.value =
+                    if (chat.remoteFrame.value == null) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
+            } else if (viewModel.show_state.value in listOf(
+                    ShowState.WAITING_FOR_FRAME,
+                    ShowState.RECEIVING_FRAME
+                )
+            ) {
+                viewModel.show_state.value = ShowState.OFF
+            }
+            updateControls()
+            updateSocketControls()
+        }
+        chat.remoteFrame.observe(viewLifecycleOwner) { bitmap ->
+            binding.remotePreview.setImageBitmap(bitmap)
+            if (chat.serverRunning.value == true) {
+                val next =
+                    if (bitmap == null) ShowState.WAITING_FOR_FRAME else ShowState.RECEIVING_FRAME
+                if (viewModel.show_state.value != next) viewModel.show_state.value = next
+            }
+        }
         chat.connected.observe(viewLifecycleOwner) { updateSocketControls() }
         chat.connecting.observe(viewLifecycleOwner) { updateSocketControls() }
         chat.sending.observe(viewLifecycleOwner) { updateSocketControls() }
@@ -289,45 +310,21 @@ class MainFragment : Fragment() {
 
     private fun updateControls() {
         val current = _binding ?: return
-        current.btnSwitchCamera.isEnabled = !viewModel.projectionPending
-        current.btnScreenRecording.isEnabled = !viewModel.projectionPending
+        current.btnSwitchCamera.isEnabled =
+            !viewModel.projectionPending && viewModel.socketChat.serverRunning.value != true
+        current.btnScreenRecording.isEnabled =
+            !viewModel.projectionPending && viewModel.socketChat.serverRunning.value != true
         current.btnScreenRecording.setText(if (viewModel.show_state.value == ShowState.PROJECTION_ON) R.string.stop_projection else R.string.start_projection)
         current.previewStatus.setText(
             if (viewModel.projectionPending) R.string.projection_waiting else when (viewModel.show_state.value) {
                 ShowState.CAMERA_FRONT -> R.string.preview_front_camera
                 ShowState.CAMERA_BACK -> R.string.preview_back_camera
                 ShowState.PROJECTION_ON -> R.string.preview_projection
+                ShowState.WAITING_FOR_FRAME -> R.string.preview_waiting_for_frame
+                ShowState.RECEIVING_FRAME -> R.string.preview_receiving_frame
                 else -> R.string.preview_off
             }
         )
-    }
-
-    private fun updateProjectionSurface() {
-        val textureView = _binding?.screenPreview ?: return
-        val texture = textureView.surfaceTexture ?: return
-        val size = projectionService?.captureSize?.value ?: return
-        if (textureView.width == 0 || textureView.height == 0) return
-        projectionService?.setSurface(null)
-        previewSurface?.release()
-        texture.setDefaultBufferSize(size.width, size.height)
-        previewSurface = Surface(texture)
-        projectionService?.setSurface(previewSurface)
-        val scale = minOf(
-            textureView.width.toFloat() / size.width,
-            textureView.height.toFloat() / size.height
-        )
-        textureView.setTransform(Matrix().apply {
-            setScale(
-                size.width * scale / textureView.width, size.height * scale / textureView.height,
-                textureView.width / 2f, textureView.height / 2f
-            )
-        })
-    }
-
-    private fun releasePreviewSurface() {
-        projectionService?.setSurface(null)
-        previewSurface?.release()
-        previewSurface = null
     }
 
     private fun startCamera(isFrontCamera: Boolean) {
@@ -340,12 +337,51 @@ class MainFragment : Fragment() {
             try {
                 val provider = future.get()
                 cameraProvider = provider
+                // PreviewView mirrors the front camera by default; cancel that so the
+                // local preview matches the unmirrored ImageAnalysis frames we send.
+                // COMPATIBLE mode keeps this view transform on the TextureView path.
+                current.myResultView.scaleX = if (isFrontCamera) -1f else 1f
                 val preview = Preview.Builder().build()
                     .also { it.setSurfaceProvider(current.myResultView.surfaceProvider) }
                 val selector =
                     if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
                 provider.unbindAll()
-                provider.bindToLifecycle(viewLifecycleOwner, selector, preview)
+                val chat = viewModel.socketChat
+                val analysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                var lastFrameAt = 0L
+                analysis.setAnalyzer(cameraExecutor) { image ->
+                    try {
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (chat.canSendFrames() && now - lastFrameAt >= 125) {
+                            lastFrameAt = now
+                            val source = image.toBitmap()
+                            val matrix =
+                                Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) }
+                            val rotated = android.graphics.Bitmap.createBitmap(
+                                source,
+                                0,
+                                0,
+                                source.width,
+                                source.height,
+                                matrix,
+                                true
+                            )
+                            try {
+                                chat.sendFrame(rotated)
+                            } finally {
+                                if (rotated !== source) rotated.recycle()
+                                source.recycle()
+                            }
+                        }
+                    } catch (error: RuntimeException) {
+                        Log.w(TAG, "Unable to send camera frame", error)
+                    } finally {
+                        image.close()
+                    }
+                }
+                provider.bindToLifecycle(viewLifecycleOwner, selector, preview, analysis)
             } catch (error: Exception) {
                 Log.e(TAG, "Unable to bind camera", error)
                 viewModel.show_state.value = ShowState.OFF
@@ -367,7 +403,7 @@ class MainFragment : Fragment() {
     override fun onDestroyView() {
         deviceDialog?.dismiss()
         stopCamera()
-        releasePreviewSurface()
+        cameraExecutor.shutdownNow()
         if (serviceBound) requireContext().unbindService(connection)
         serviceBound = false
         projectionService = null
