@@ -2,25 +2,19 @@ package com.android.castappx.main
 
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
-import java.util.concurrent.ExecutorService
 
 class MainViewModel: ViewModel() {
 
     val show_state = MutableLiveData(ShowState.OFF)
 
 
-    private lateinit var cameraExecutor: ExecutorService
+    var projectionPending = false
 
-    fun possibleNextState(): ShowState {
-        val currentState = show_state.value
-        val nextStates = listOf(
-            ShowState.OFF,
-            ShowState.CAMERA_FRONT,
-            ShowState.CAMERA_BACK,
-            ShowState.PROJECTION_ON
-        )
-        val nextState = nextStates[(nextStates.indexOf(currentState) + 1) % nextStates.size]
-        return nextState
+    // Screen capture is controlled by its own button, outside the camera cycle.
+    fun possibleNextState(): ShowState = when (show_state.value) {
+        ShowState.CAMERA_FRONT -> ShowState.CAMERA_BACK
+        ShowState.CAMERA_BACK -> ShowState.OFF
+        else -> ShowState.CAMERA_FRONT
     }
 
 

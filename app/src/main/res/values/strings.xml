@@ -2,4 +2,19 @@
     <string name="app_name">CastAPPX</string>
     <!-- TODO: Remove or change this placeholder text -->
     <string name="hello_blank_fragment">Hello blank fragment</string>
+    <string name="switch_camera">切换摄像头</string>
+    <string name="start_projection">屏幕录制</string>
+    <string name="stop_projection">停止录屏</string>
+    <string name="preview_off">画面已关闭，点击左侧按钮开启摄像头或右侧按钮录制屏幕</string>
+    <string name="preview_front_camera">前置摄像头</string>
+    <string name="preview_back_camera">后置摄像头</string>
+    <string name="preview_projection">正在显示屏幕录制画面</string>
+    <string name="projection_waiting">请在系统弹窗中授权屏幕录制</string>
+    <string name="projection_cancelled">已取消屏幕录制，保留当前画面</string>
+    <string name="projection_failed">屏幕录制启动失败，请重新授权后重试</string>
+    <string name="camera_permission_required">请先授予摄像头权限</string>
+    <string name="camera_failed">无法打开摄像头</string>
+    <string name="projection_channel">屏幕录制</string>
+    <string name="projection_notification_title">正在录制屏幕画面</string>
+    <string name="projection_notification_text">点击返回预览，或停止屏幕录制</string>
 </resources>

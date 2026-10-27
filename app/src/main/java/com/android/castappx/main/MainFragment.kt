@@ -1,25 +1,33 @@
 package com.android.castappx.main
 
+import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import android.os.IBinder
 import android.util.Log
 import android.view.LayoutInflater
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FallbackStrategy
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
-import androidx.camera.video.Recorder
-import androidx.camera.video.VideoCapture
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toDrawable
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.ViewModelProvider
 import com.android.castappx.MainActivity
+import com.android.castappx.R
 import com.android.castappx.databinding.FragmentMainBinding
 import com.android.castappx.utilOrHelper.PermissionHelper
 import com.android.castappx.utilOrHelper.PermissionHelper.checkPermission
@@ -29,134 +37,232 @@ class MainFragment : Fragment() {
     private var _binding: FragmentMainBinding? = null
     private val binding get() = _binding!!
 
-    private val viewModel: MainViewModel by lazy {
-        ViewModelProvider(this).get(MainViewModel::class.java)
-    }
+    private val viewModel by lazy { ViewModelProvider(this)[MainViewModel::class.java] }
 
-    private var videoCapture: VideoCapture<Recorder>? = null
     private var cameraProvider: ProcessCameraProvider? = null
 
+    private var projectionService: MyMediaProjectionService? = null
+    private var serviceBound = false
+    private var previewSurface: Surface? = null
+
+    private val projectionPermission =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+                try {
+                    ContextCompat.startForegroundService(
+                        requireContext(), serviceIntent()
+                            .setAction(MyMediaProjectionService.ACTION_START)
+                            .putExtra(MyMediaProjectionService.EXTRA_CONSENT, result.data)
+                    )
+                } catch (error: RuntimeException) {
+                    viewModel.projectionPending = false
+                    updateControls()
+                    showMessage(R.string.projection_failed)
+                    Log.e(TAG, "Unable to start projection service", error)
+                }
+            } else {
+                viewModel.projectionPending = false
+                updateControls()
+                showMessage(R.string.projection_cancelled)
+            }
+        }
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            val service = (binder as MyMediaProjectionService.LocalBinder).service
+            projectionService = service
+            service.captureSize.observe(viewLifecycleOwner) { updateProjectionSurface() }
+            service.error.observe(viewLifecycleOwner) { failed ->
+                if (failed) {
+                    viewModel.projectionPending = false
+                    updateControls()
+                    showMessage(R.string.projection_failed)
+                }
+            }
+            service.active.observe(viewLifecycleOwner) { active ->
+                if (active) {
+                    viewModel.projectionPending = false
+                    viewModel.show_state.value = ShowState.PROJECTION_ON
+                } else if (viewModel.show_state.value == ShowState.PROJECTION_ON) {
+                    viewModel.show_state.value = ShowState.OFF
+                }
+                updateControls()
+            }
+            updateProjectionSurface()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            projectionService = null
+            viewModel.projectionPending = false
+            if (viewModel.show_state.value == ShowState.PROJECTION_ON) viewModel.show_state.value =
+                ShowState.OFF
+            updateControls()
+        }
+    }
+
     override fun onCreateView(
-        inflater: LayoutInflater, container: ViewGroup?,
+        inflater: LayoutInflater,
+        container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View? {
+    ): View {
         _binding = FragmentMainBinding.inflate(inflater, container, false)
-
-        binding.mainViewModel = viewModel
-        binding.lifecycleOwner = viewLifecycleOwner
-
-
-        viewModel.show_state.observe(viewLifecycleOwner, { newState ->
-            when (newState) {
-                ShowState.OFF -> {
-                    // Handle OFF state
-                }
-
-                ShowState.CAMERA_FRONT -> {
-                    // Handle CAMERA_FRONT state
-                    startCamera(isFrontCamera = true)
-                }
-
-                ShowState.CAMERA_BACK -> {
-                    // Handle CAMERA_BACK state
-                    startCamera(isFrontCamera = false)
-                }
-
-                ShowState.PROJECTION_ON -> {
-                    // Handle PROJECTION_ON state
-                    stopCamera()
-                }
-            }
-        })
-
-        binding.btnSwitchCamera.setOnClickListener {
-            val nextState = viewModel.possibleNextState()
-
-            if (nextState in listOf(ShowState.CAMERA_FRONT, ShowState.CAMERA_BACK)
-                && !checkPermission(requireContext(), PermissionHelper.CAMERA_PERMISSION)
-            ) {
-                (requireActivity() as MainActivity).showStackedToast("Camera permission is required")
-                return@setOnClickListener
-            }
-
-            if (nextState == ShowState.PROJECTION_ON) {
-                // TODO: Handle PROJECTION_ON state
-            }
-
-            viewModel.show_state.value = nextState
-        }
-
-        binding.myResultView.previewStreamState.observe(viewLifecycleOwner) { newState ->
-            when (newState) {
-                PreviewView.StreamState.IDLE -> {
-                    Log.d(TAG, "PreviewView.StreamState.IDLE")
-                    binding.myResultView.foreground = Color.BLACK.toDrawable()
-                }
-
-                PreviewView.StreamState.STREAMING -> {
-                    Log.d(TAG, "PreviewView.StreamState.STREAMING")
-                    binding.myResultView.foreground = null
-                }
-            }
-        }
-
-
-
-
         return binding.root
     }
 
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        binding.mainViewModel = viewModel
+        binding.lifecycleOwner = viewLifecycleOwner
+
+        binding.screenPreview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(
+                texture: SurfaceTexture,
+                width: Int,
+                height: Int
+            ) = updateProjectionSurface()
+
+            override fun onSurfaceTextureSizeChanged(
+                texture: SurfaceTexture,
+                width: Int,
+                height: Int
+            ) = updateProjectionSurface()
+
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                releasePreviewSurface()
+                return true
+            }
+        }
+        viewModel.show_state.observe(viewLifecycleOwner) { state ->
+            val projecting = state == ShowState.PROJECTION_ON
+            binding.screenPreview.visibility = if (projecting) View.VISIBLE else View.GONE
+            binding.myResultView.visibility = if (projecting) View.GONE else View.VISIBLE
+            when (state) {
+                ShowState.CAMERA_FRONT -> startCamera(true)
+                ShowState.CAMERA_BACK -> startCamera(false)
+                ShowState.OFF, ShowState.PROJECTION_ON -> stopCamera()
+            }
+            updateControls()
+        }
+        binding.btnSwitchCamera.setOnClickListener {
+            if (viewModel.projectionPending) return@setOnClickListener
+            val next = viewModel.possibleNextState()
+            if (next == ShowState.CAMERA_FRONT || next == ShowState.CAMERA_BACK) {
+                if (!checkPermission(requireContext(), PermissionHelper.CAMERA_PERMISSION)) {
+                    showMessage(R.string.camera_permission_required)
+                    return@setOnClickListener
+                }
+            }
+            if (viewModel.show_state.value == ShowState.PROJECTION_ON) projectionService?.stopCapture()
+            viewModel.show_state.value = next
+        }
+        binding.btnScreenRecording.setOnClickListener {
+            if (viewModel.projectionPending) return@setOnClickListener
+            if (viewModel.show_state.value == ShowState.PROJECTION_ON) {
+                projectionService?.stopCapture()
+            } else {
+                requestProjection()
+            }
+        }
+        binding.myResultView.previewStreamState.observe(viewLifecycleOwner) { state ->
+            binding.myResultView.foreground =
+                if (state == PreviewView.StreamState.STREAMING) null else Color.BLACK.toDrawable()
+        }
+        serviceBound =
+            requireContext().bindService(serviceIntent(), connection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun requestProjection() {
+        viewModel.projectionPending = true
+        updateControls()
+        val manager = requireContext().getSystemService(MediaProjectionManager::class.java)
+        projectionPermission.launch(manager.createScreenCaptureIntent())
+    }
+
+    private fun updateControls() {
+        val current = _binding ?: return
+        current.btnSwitchCamera.isEnabled = !viewModel.projectionPending
+        current.btnScreenRecording.isEnabled = !viewModel.projectionPending
+        current.btnScreenRecording.setText(if (viewModel.show_state.value == ShowState.PROJECTION_ON) R.string.stop_projection else R.string.start_projection)
+        current.previewStatus.setText(
+            if (viewModel.projectionPending) R.string.projection_waiting else when (viewModel.show_state.value) {
+                ShowState.CAMERA_FRONT -> R.string.preview_front_camera
+                ShowState.CAMERA_BACK -> R.string.preview_back_camera
+                ShowState.PROJECTION_ON -> R.string.preview_projection
+                else -> R.string.preview_off
+            }
+        )
+    }
+
+    private fun updateProjectionSurface() {
+        val textureView = _binding?.screenPreview ?: return
+        val texture = textureView.surfaceTexture ?: return
+        val size = projectionService?.captureSize?.value ?: return
+        if (textureView.width == 0 || textureView.height == 0) return
+        projectionService?.setSurface(null)
+        previewSurface?.release()
+        texture.setDefaultBufferSize(size.width, size.height)
+        previewSurface = Surface(texture)
+        projectionService?.setSurface(previewSurface)
+        val scale = minOf(
+            textureView.width.toFloat() / size.width,
+            textureView.height.toFloat() / size.height
+        )
+        textureView.setTransform(Matrix().apply {
+            setScale(
+                size.width * scale / textureView.width, size.height * scale / textureView.height,
+                textureView.width / 2f, textureView.height / 2f
+            )
+        })
+    }
+
+    private fun releasePreviewSurface() {
+        projectionService?.setSurface(null)
+        previewSurface?.release()
+        previewSurface = null
+    }
 
     private fun startCamera(isFrontCamera: Boolean) {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(requireContext())
-
-        cameraProviderFuture.addListener({
-            // Used to bind the lifecycle of cameras to the lifecycle owner
-
-            val cameraProvider = cameraProviderFuture.get()
-            this.cameraProvider = cameraProvider
-
-            // Preview
-            val preview = Preview.Builder()
-                .build()
-                .also {
-                    it.setSurfaceProvider(binding.myResultView.surfaceProvider)
-                }
-
-            val recorder = Recorder.Builder()
-                .setQualitySelector(
-                    QualitySelector.from(
-                        Quality.HIGHEST,
-                        FallbackStrategy.higherQualityOrLowerThan(Quality.SD)
-                    )
-                )
-                .build()
-            videoCapture = VideoCapture.withOutput(recorder)
-
-
-            val cameraSelector =
-                if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-
+        val context = requireContext()
+        val requestedState = if (isFrontCamera) ShowState.CAMERA_FRONT else ShowState.CAMERA_BACK
+        val future = ProcessCameraProvider.getInstance(context)
+        future.addListener({
+            val current = _binding ?: return@addListener
+            if (viewModel.show_state.value != requestedState) return@addListener
             try {
-                // Unbind use cases before rebinding
-                cameraProvider.unbindAll()
-
-                cameraProvider.bindToLifecycle(
-                    viewLifecycleOwner,
-                    cameraSelector,
-                    preview,
-                    videoCapture
-                )
-
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
+                val provider = future.get()
+                cameraProvider = provider
+                val preview = Preview.Builder().build()
+                    .also { it.setSurfaceProvider(current.myResultView.surfaceProvider) }
+                val selector =
+                    if (isFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                provider.unbindAll()
+                provider.bindToLifecycle(viewLifecycleOwner, selector, preview)
+            } catch (error: Exception) {
+                Log.e(TAG, "Unable to bind camera", error)
+                viewModel.show_state.value = ShowState.OFF
+                showMessage(R.string.camera_failed)
             }
-
-        }, ContextCompat.getMainExecutor(requireContext()))
+        }, ContextCompat.getMainExecutor(context))
     }
 
     private fun stopCamera() {
         cameraProvider?.unbindAll()
+        _binding?.myResultView?.foreground = Color.BLACK.toDrawable()
+    }
+
+    private fun serviceIntent() = Intent(requireContext(), MyMediaProjectionService::class.java)
+    private fun showMessage(message: Int) {
+        (activity as? MainActivity)?.showStackedToast(getString(message))
+    }
+
+    override fun onDestroyView() {
+        stopCamera()
+        releasePreviewSurface()
+        if (serviceBound) requireContext().unbindService(connection)
+        serviceBound = false
+        projectionService = null
+        _binding = null
+        super.onDestroyView()
     }
 
     companion object {
